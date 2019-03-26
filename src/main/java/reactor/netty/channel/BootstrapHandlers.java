@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *       http://www.apache.org/licenses/LICENSE-2.0
+ *       https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -250,10 +250,10 @@ public abstract class BootstrapHandlers {
 				(ConnectionObserver) b.config()
 				                             .options()
 				                             .get(OBSERVER_OPTION);
-		b.option(OBSERVER_OPTION, null);
 		if (obs == null) {
 			return ConnectionObserver.emptyListener(); //will not be triggered in
 		}
+		b.option(OBSERVER_OPTION, null);
 		return obs;
 	}
 
@@ -285,10 +285,10 @@ public abstract class BootstrapHandlers {
 		ConnectionObserver obs = (ConnectionObserver) b.config()
 		                                               .childOptions()
 		                                               .get(OBSERVER_OPTION);
-		b.childOption(OBSERVER_OPTION, null);
 		if (obs == null) {
 			return ConnectionObserver.emptyListener(); //will not be triggered in
 		}
+		b.childOption(OBSERVER_OPTION, null);
 		return obs;
 	}
 
