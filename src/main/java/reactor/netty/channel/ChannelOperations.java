@@ -233,9 +233,9 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 
 	@Override
 	public NettyOutbound sendObject(Object message) {
-		onTerminate().subscribe(null, null, () -> ReactorNetty.safeRelease(message));
 		return then(FutureMono.deferFuture(() -> connection.channel()
-		                                                   .writeAndFlush(message)));
+		                                                   .writeAndFlush(message)),
+				() -> ReactorNetty.safeRelease(message));
 	}
 
 	@Override
@@ -380,7 +380,7 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 			// HttpClientOperations need to notify with error
 			// when there is no response state
 			onInboundComplete();
-			if (isPersistent()) {
+			if (channel().isActive() && isPersistent()) {
 				channel().writeAndFlush(TERMINATED_OPS, this);
 			}
 			else {

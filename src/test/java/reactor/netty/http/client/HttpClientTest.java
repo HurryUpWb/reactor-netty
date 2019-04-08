@@ -18,6 +18,7 @@ package reactor.netty.http.client;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
@@ -39,20 +40,25 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpContentDecompressor;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpObjectDecoder;
 import io.netty.handler.codec.http.HttpResponseEncoder;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
@@ -1667,5 +1673,184 @@ public class HttpClientTest {
 		assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 
 		server.dispose();
+	}
+
+	@Test
+	public void testIssue694() {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .handle((req, res) -> {
+				              req.receive()
+				                 .subscribe();
+				              return Mono.empty();
+				          })
+				          .wiretap(true)
+				          .bindNow();
+
+		HttpClient client = createHttpClientForContextWithPort(server);
+
+		ByteBufAllocator alloc =ByteBufAllocator.DEFAULT;
+
+		ByteBuf buffer1 = alloc.buffer()
+		                       .writeInt(1)
+		                       .retain(9);
+		client.request(HttpMethod.GET)
+		      .send((req, out) -> out.send(Flux.range(0, 10)
+		                                       .map(i -> buffer1)))
+		      .response()
+		      .block(Duration.ofSeconds(30));
+
+		assertThat(buffer1.refCnt()).isEqualTo(0);
+
+		ByteBuf buffer2 = alloc.buffer()
+		                       .writeInt(1)
+		                       .retain(9);
+		client.request(HttpMethod.GET)
+		      .send(Flux.range(0, 10)
+		                .map(i -> buffer2))
+		      .response()
+		      .block(Duration.ofSeconds(30));
+
+		assertThat(buffer2.refCnt()).isEqualTo(0);
+
+		server.disposeNow();
+	}
+
+	@Test
+	@Ignore
+	public void testIssue700() {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .handle((req, res) ->
+				                  res.options(o -> o.flushOnEach(false))
+				                     .sendString(Flux.range(0, 10)
+				                                     .map(i -> "test")
+				                                     .delayElements(Duration.ofMillis(4))))
+				          .bindNow();
+
+		HttpClient client = createHttpClientForContextWithAddress(server);
+		for(int i = 0; i < 500; ++i) {
+			try {
+				client.get()
+				      .uri("/")
+				      .responseContent()
+				      .aggregate()
+				      .asString()
+				      .timeout(Duration.ofMillis(ThreadLocalRandom.current().nextInt(1, 35)))
+				      .block(Duration.ofMillis(100));
+			}
+			catch (Throwable t) {}
+		}
+
+		System.gc();
+		for(int i = 0; i < 100000; ++i) {
+			int[] arr = new int[100000];
+		}
+		System.gc();
+
+		server.disposeNow();
+	}
+
+	@Test
+	public void httpClientResponseConfigInjectAttributes() {
+		AtomicReference<Channel> channelRef = new AtomicReference<>();
+		AtomicReference<Boolean> validate = new AtomicReference<>();
+		AtomicReference<Integer> chunkSize = new AtomicReference<>();
+
+		DisposableServer server =
+				HttpServer.create()
+				          .handle((req, resp) -> req.receive()
+				                                    .then(resp.sendNotFound()))
+				          .wiretap(true)
+				          .bindNow();
+
+		createHttpClientForContextWithAddress(server)
+		        .httpResponseDecoder(opt -> opt.maxInitialLineLength(123)
+		                                       .maxHeaderSize(456)
+		                                       .maxChunkSize(789)
+		                                       .validateHeaders(false)
+		                                       .initialBufferSize(10)
+		                                       .failOnMissingResponse(true)
+		                                       .parseHttpAfterConnectRequest(true))
+		        .tcpConfiguration(tcp ->
+		                tcp.doOnConnected(c -> {
+		                    channelRef.set(c.channel());
+		                    HttpClientCodec codec = c.channel()
+		                                             .pipeline()
+		                                             .get(HttpClientCodec.class);
+		                    HttpObjectDecoder decoder = (HttpObjectDecoder) getValueReflection(codec, "inboundHandler", 1);
+		                    chunkSize.set((Integer) getValueReflection(decoder, "maxChunkSize", 2));
+		                    validate.set((Boolean) getValueReflection(decoder, "validateHeaders", 2));
+		                }))
+		        .post()
+		        .uri("/")
+		        .send(ByteBufFlux.fromString(Mono.just("bodysample")))
+		        .responseContent()
+		        .aggregate()
+		        .asString()
+		        .block(Duration.ofSeconds(30));
+
+		assertThat(channelRef.get()).isNotNull();
+
+		server.disposeNow();
+
+		assertThat(chunkSize.get()).as("line length").isEqualTo(789);
+		assertThat(validate.get()).as("validate headers").isFalse();
+	}
+
+	private Object getValueReflection(Object obj, String fieldName, int superLevel) {
+		try {
+			Field field;
+			if (superLevel == 1) {
+				field = obj.getClass()
+				           .getSuperclass()
+				           .getDeclaredField(fieldName);
+			}
+			else {
+				field = obj.getClass()
+				           .getSuperclass()
+				           .getSuperclass()
+				           .getDeclaredField(fieldName);
+			}
+			field.setAccessible(true);
+			return field.get(obj);
+		}
+		catch (NoSuchFieldException | IllegalAccessException e) {
+			return new RuntimeException(e);
+		}
+	}
+
+	@Test
+	public void testDoOnRequestInvokedBeforeSendingRequest() {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .handle((req, res) -> res.send(req.receive()
+				                                            .retain()))
+				          .wiretap(true)
+				          .bindNow();
+
+		StepVerifier.create(
+		        createHttpClientForContextWithAddress(server)
+		                  .doOnRequest((req, con) -> req.header("test", "test"))
+		                  .post()
+		                  .uri("/")
+		                  .send((req, out) -> {
+		                      String header = req.requestHeaders().get("test");
+		                      if (header != null) {
+		                          return out.sendString(Flux.just("FOUND"));
+		                      }
+		                      else {
+		                          return out.sendString(Flux.just("NOT_FOUND"));
+		                      }
+		                  })
+		                  .responseSingle((res, bytes) -> bytes.asString()))
+		            .expectNext("FOUND")
+		            .expectComplete()
+		            .verify(Duration.ofSeconds(30));
+
+		server.disposeNow();
 	}
 }
